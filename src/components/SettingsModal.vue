@@ -262,6 +262,7 @@ async function startImport() {
                 />
               </div>
             </div>
+
             <div class="field">
               <label id="log-refresh-interval-label">Log refresh interval</label>
               <Dropdown

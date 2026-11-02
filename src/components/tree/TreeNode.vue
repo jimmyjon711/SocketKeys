@@ -2,17 +2,22 @@
 /**
  * One row of the object tree, recursing into itself for children.
  *
- * Two modes share one component:
+ * Three modes share one component:
  *  - `object-root`: a top-level printer object. Expanding subscribes to it,
  *    collapsing unsubscribes — this is what drives live updates.
+ *  - `custom-root`: a user-defined custom endpoint (see customEndpoints.ts).
+ *    No subscribe/notify — expanding fetches once, refresh button re-fetches.
  *  - `value`: any JSON value inside an already-subscribed object. Expanding is
  *    purely local, since Moonraker can't subscribe below object granularity.
  */
-import { computed, ref } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import {
   collapseObject,
   expandObject,
+  fetchCustomEndpoint,
   objectStoreState,
+  trackCustomEndpointActive,
+  untrackCustomEndpointActive,
 } from "../../lib/moonraker/objectStore";
 import { buildMacroVariable } from "../../lib/macroVariable";
 import { copyToClipboard } from "../../lib/clipboard";
@@ -21,14 +26,20 @@ import { showToast } from "../../lib/toast";
 const props = withDefaults(
   defineProps<{
     label: string;
-    kind?: "object-root" | "value";
+    kind?: "object-root" | "custom-root" | "value";
     value?: unknown;
     depth?: number;
     /** Ancestor keys from the root object down to (not including) this node. */
     path?: string[];
+    /** `custom-root` only — id into objectStoreState.customStatus/etc. */
+    endpointId?: string;
+    /** `custom-root` only — raw path as typed, e.g. "/printer/afc/status". */
+    endpointPath?: string;
   }>(),
   { kind: "value", depth: 0, path: () => [] },
 );
+
+const emit = defineEmits<{ remove: [] }>();
 
 /** This node's own full key chain, for building its macro-variable reference
  *  and for handing down to children as their `path`. */
@@ -46,8 +57,11 @@ const MAX_DEPTH = 20;
 const MAX_CHILDREN = 200;
 
 const localExpanded = ref(false);
+/** Has this custom-root ever finished a fetch (success or error)? */
+const customFetched = ref(false);
 
 const isRoot = computed(() => props.kind === "object-root");
+const isCustomRoot = computed(() => props.kind === "custom-root");
 
 const expanded = computed(() =>
   isRoot.value
@@ -55,14 +69,22 @@ const expanded = computed(() =>
     : localExpanded.value,
 );
 
-const loading = computed(
-  () => isRoot.value && objectStoreState.pendingSubscribe.has(props.label),
+const loading = computed(() => {
+  if (isRoot.value) return objectStoreState.pendingSubscribe.has(props.label);
+  if (isCustomRoot.value) return objectStoreState.customLoading[props.endpointId ?? ""] ?? false;
+  return false;
+});
+
+const customError = computed(() =>
+  isCustomRoot.value ? objectStoreState.customError[props.endpointId ?? ""] ?? null : null,
 );
 
-/** Root nodes read live status from the store; value nodes use their prop. */
-const resolvedValue = computed(() =>
-  isRoot.value ? objectStoreState.status[props.label] : props.value,
-);
+/** Root reads live status; custom-root reads its own fetch result; value uses its prop. */
+const resolvedValue = computed(() => {
+  if (isRoot.value) return objectStoreState.status[props.label];
+  if (isCustomRoot.value) return objectStoreState.customStatus[props.endpointId ?? ""];
+  return props.value;
+});
 
 const valueKind = computed<"object" | "array" | "scalar">(() => {
   const value = resolvedValue.value;
@@ -90,6 +112,11 @@ const expandable = computed(() => {
     // "no children" for something that may well turn out to have some.
     if (rootChildCount.value === undefined) return true;
     return rootChildCount.value > 0;
+  }
+  if (isCustomRoot.value) {
+    // Shape is unknown until the first fetch resolves.
+    if (!customFetched.value) return true;
+    return valueKind.value !== "scalar";
   }
   return valueKind.value !== "scalar" && props.depth < MAX_DEPTH;
 });
@@ -125,7 +152,7 @@ const truncatedCount = computed(() => {
 /** Short inline preview so collapsed branches still say something useful. */
 const summary = computed(() => {
   const value = resolvedValue.value;
-  if (isRoot.value && !expanded.value) return "";
+  if ((isRoot.value || isCustomRoot.value) && !expanded.value) return "";
   if (Array.isArray(value)) return `[${value.length}]`;
   if (typeof value === "object" && value !== null) {
     return `{${Object.keys(value).length}}`;
@@ -149,6 +176,14 @@ const scalarClass = computed(() => {
   return "";
 });
 
+/** Re-fetches a custom endpoint without touching its expanded state. */
+function refreshCustom() {
+  if (!props.endpointId || !props.endpointPath) return;
+  fetchCustomEndpoint(props.endpointId, props.endpointPath).then(() => {
+    customFetched.value = true;
+  });
+}
+
 function toggle() {
   if (!expandable.value) return;
 
@@ -159,22 +194,40 @@ function toggle() {
   }
   localExpanded.value = !localExpanded.value;
 }
+
+// Expanding joins the shared poll (objectStore.ts) and fetches right away;
+// collapsing or unmounting leaves it.
+watch(expanded, (isExpanded) => {
+  if (!isCustomRoot.value || !props.endpointId || !props.endpointPath) return;
+  if (isExpanded) {
+    refreshCustom();
+    trackCustomEndpointActive(props.endpointId, props.endpointPath);
+  } else {
+    untrackCustomEndpointActive(props.endpointId);
+  }
+});
+
+onUnmounted(() => {
+  if (isCustomRoot.value && props.endpointId && expanded.value) {
+    untrackCustomEndpointActive(props.endpointId);
+  }
+});
 </script>
 
 <template>
   <li class="node">
     <div
       class="row"
-      :class="{ expandable, root: isRoot }"
+      :class="{ expandable, root: isRoot || isCustomRoot }"
       :style="{ paddingLeft: `${depth * 12 + 8}px` }"
       role="treeitem"
       :aria-expanded="expandable ? expanded : undefined"
       :tabindex="expandable ? 0 : -1"
-      :title="macroVariable"
+      :title="isCustomRoot ? endpointPath : macroVariable"
       @click="toggle"
       @keydown.enter.prevent="toggle"
       @keydown.space.prevent="toggle"
-      @contextmenu.prevent="copyMacroVariable"
+      @contextmenu.prevent="!isCustomRoot && copyMacroVariable()"
     >
       <span class="arrow" :class="{ open: expanded, hidden: !expandable }">
         <svg viewBox="0 0 10 10" aria-hidden="true">
@@ -184,13 +237,46 @@ function toggle() {
 
       <span class="label">{{ label }}</span>
 
-      <span v-if="loading" class="meta">loading…</span>
+      <span v-if="isCustomRoot && customError" class="meta error">{{ customError }}</span>
+      <span v-else-if="loading" class="meta">loading…</span>
       <span v-else-if="isRoot && !expanded && rootChildCountLabel" class="value">
         {{ rootChildCountLabel }}
       </span>
       <span v-else-if="summary" class="value" :class="scalarClass">
         {{ summary }}
       </span>
+
+      <button
+        v-if="isCustomRoot"
+        type="button"
+        class="row-btn"
+        title="Refresh"
+        aria-label="Refresh"
+        @click.stop="refreshCustom"
+      >
+        <svg viewBox="0 0 10 10" aria-hidden="true">
+          <path
+            d="M8.5 5a3.5 3.5 0 1 1-1-2.45M8.5 1.5v2.5H6"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+      <button
+        v-if="isCustomRoot"
+        type="button"
+        class="row-btn"
+        title="Remove"
+        aria-label="Remove"
+        @click.stop="emit('remove')"
+      >
+        <svg viewBox="0 0 10 10" aria-hidden="true">
+          <path d="M0.5 0.5l9 9M9.5 0.5l-9 9" fill="none" stroke="currentColor" stroke-width="1.2" />
+        </svg>
+      </button>
     </div>
 
     <ul v-if="expanded && children.length" class="children" role="group">
@@ -296,6 +382,41 @@ function toggle() {
 .meta {
   color: var(--text-muted);
   font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.meta.error {
+  color: var(--error);
+  font-style: normal;
+}
+
+.row-btn {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  display: none;
+  place-items: center;
+  border: 0;
+  padding: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.row:hover .row-btn {
+  display: grid;
+}
+
+.row-btn:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.row-btn svg {
+  width: 8px;
+  height: 8px;
 }
 
 .children {

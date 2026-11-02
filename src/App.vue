@@ -9,6 +9,7 @@ import ConsolePanel from "./components/console/ConsolePanel.vue";
 import LogsPanel from "./components/logs/LogsPanel.vue";
 import MacrosPanel from "./components/macros/MacrosPanel.vue";
 import WebPanel from "./components/web/WebPanel.vue";
+import CustomEndpointsPanel from "./components/custom/CustomEndpointsPanel.vue";
 import Toast from "./components/Toast.vue";
 import { activeFrame } from "./lib/settings";
 import { checkForUpdate } from "./lib/updateCheck";
@@ -19,6 +20,7 @@ import { isMobile } from "./lib/platform";
  *  circular import (those live *inside* these same components' headers). */
 const FRAME_COMPONENTS: Record<string, unknown> = {
   "printer-objects": ObjectTree,
+  "custom-endpoints": CustomEndpointsPanel,
   console: ConsolePanel,
   logs: LogsPanel,
   macros: MacrosPanel,

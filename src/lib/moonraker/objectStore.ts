@@ -9,7 +9,9 @@
  */
 
 import { reactive, watch } from "vue";
+import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { connectionState, getClient, onNotification } from "./connection";
+import { settingsState } from "../settings";
 import type {
   NotifyStatusUpdateParams,
   PrinterObjectsListResult,
@@ -36,6 +38,13 @@ export const objectStoreState = reactive({
    */
   childCounts: {} as Record<string, number>,
   childCountsLoaded: false,
+  /**
+   * User-defined custom endpoints (see customEndpoints.ts), keyed by id.
+   * `undefined` means "never fetched yet".
+   */
+  customStatus: {} as Record<string, unknown>,
+  customLoading: {} as Record<string, boolean>,
+  customError: {} as Record<string, string | null>,
 });
 
 export async function loadObjectList(): Promise<void> {
@@ -103,6 +112,97 @@ function childCountOf(value: unknown): number {
   return 0;
 }
 
+/**
+ * One-off query for a user-defined custom endpoint — no subscription, so the
+ * caller decides when to re-fetch. `path` is whatever the user typed, e.g.
+ * "/printer/afc/status".
+ *
+ * Does a real HTTP GET against Moonraker's REST router rather than guessing
+ * a JSON-RPC method name, since that mapping isn't derivable from a typed
+ * path alone (Moonraker prefixes ambiguous methods with the verb, e.g.
+ * `server.database.get_item` rather than `server.database.item`).
+ *
+ * Uses Tauri's HTTP plugin, not the webview's `fetch()`, to avoid Moonraker's
+ * CORS policy (same as logs.ts's log-content fetch).
+ */
+export async function fetchCustomEndpoint(id: string, path: string): Promise<void> {
+  const base = connectionState.httpBaseUrl;
+  if (!base) return;
+
+  objectStoreState.customLoading[id] = true;
+  objectStoreState.customError[id] = null;
+  try {
+    const trimmed = path.trim();
+    const url = `${base}${trimmed.startsWith("/") ? trimmed : `/${trimmed}`}`;
+    const response = await tauriFetch(url, { method: "GET" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const body: unknown = await response.json();
+    // Moonraker wraps payloads as `{ result: ... }`; unwrap so the row shows
+    // the same shape a built-in object would. Non-Moonraker bodies pass through as-is.
+    objectStoreState.customStatus[id] =
+      isPlainObject(body) && "result" in body ? body.result : body;
+  } catch (err) {
+    objectStoreState.customError[id] = err instanceof Error ? err.message : String(err);
+  } finally {
+    objectStoreState.customLoading[id] = false;
+  }
+}
+
+/** Drops a removed endpoint's cached state. */
+export function forgetCustomEndpoint(id: string): void {
+  delete objectStoreState.customStatus[id];
+  delete objectStoreState.customLoading[id];
+  delete objectStoreState.customError[id];
+  untrackCustomEndpointActive(id);
+}
+
+/**
+ * Custom endpoints have no subscribe/notify equivalent, so "live" means
+ * polling instead — one shared timer re-fetching every expanded endpoint,
+ * mirroring logs.ts's tail-polling timer.
+ */
+const activeCustomEndpoints = new Map<string, string>();
+let customPollTimer: ReturnType<typeof setInterval> | null = null;
+
+function stopCustomPolling(): void {
+  if (customPollTimer !== null) {
+    clearInterval(customPollTimer);
+    customPollTimer = null;
+  }
+}
+
+function startCustomPolling(): void {
+  stopCustomPolling();
+  if (!activeCustomEndpoints.size) return;
+  // Reuses the Logs panel's refresh-interval setting rather than adding a second cadence.
+  customPollTimer = setInterval(() => {
+    for (const [id, path] of activeCustomEndpoints) {
+      if (!objectStoreState.customLoading[id]) void fetchCustomEndpoint(id, path);
+    }
+  }, settingsState.logRefreshIntervalMs);
+}
+
+// Apply an interval change immediately, not just on the next expand.
+watch(
+  () => settingsState.logRefreshIntervalMs,
+  () => {
+    if (customPollTimer !== null) startCustomPolling();
+  },
+);
+
+/** Called when a custom-root row expands — starts (or joins) the shared poll. */
+export function trackCustomEndpointActive(id: string, path: string): void {
+  activeCustomEndpoints.set(id, path);
+  if (customPollTimer === null) startCustomPolling();
+}
+
+/** Called when a custom-root row collapses or unmounts still expanded. */
+export function untrackCustomEndpointActive(id: string): void {
+  activeCustomEndpoints.delete(id);
+  if (!activeCustomEndpoints.size) stopCustomPolling();
+}
+
 export async function expandObject(name: string): Promise<void> {
   if (objectStoreState.subscribedNames.has(name)) return;
   objectStoreState.subscribedNames.add(name);
@@ -145,6 +245,12 @@ export function reset(): void {
   objectStoreState.pendingSubscribe.clear();
   objectStoreState.childCounts = {};
   objectStoreState.childCountsLoaded = false;
+  // A dropped connection invalidates cached data, but expanded rows and the
+  // poll timer stay as-is — each tick is a no-op without a client and
+  // resumes on its own once reconnected.
+  objectStoreState.customStatus = {};
+  objectStoreState.customLoading = {};
+  objectStoreState.customError = {};
 }
 
 // Serialize subscribe calls so rapid expand/collapse can't race: each request

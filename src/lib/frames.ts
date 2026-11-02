@@ -19,6 +19,7 @@ export interface FrameMeta {
 
 const BUILTIN_FRAMES: FrameMeta[] = [
   { id: "printer-objects", name: "Printer Objects" },
+  { id: "custom-endpoints", name: "Custom Endpoint" },
   { id: "console", name: "Console" },
   { id: "logs", name: "Logs" },
   { id: "macros", name: "Macros" },
